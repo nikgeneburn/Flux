@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["Core", "Sdk", "Modules/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+FluxSdk = { path = "Sdk", package = "flux-sdk" }
+
+[workspace.dependencies.windows]
+version = "0.62"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+debug = "line-tables-only"
+strip = "none"
+
+

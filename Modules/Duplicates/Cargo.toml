@@ -1,0 +1,13 @@
+[package]
+name = "flux-module-duplicates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "Duplicates"
+crate-type = ["cdylib"]
+path = "Source/lib.rs"
+
+[dependencies]
+FluxSdk.workspace = true

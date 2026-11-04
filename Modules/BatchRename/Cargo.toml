@@ -1,0 +1,20 @@
+[package]
+name = "flux-module-batchrename"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "BatchRename"
+crate-type = ["cdylib"]
+path = "Source/lib.rs"
+
+[dependencies]
+FluxSdk.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Time",
+]
