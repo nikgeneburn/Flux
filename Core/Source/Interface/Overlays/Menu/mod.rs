@@ -231,11 +231,9 @@ impl App {
         let Mode = Tab.View;
         let Sort = Tab.Sort;
         if InFolder {
-            Entries.push(MenuEntry::Group(
-                "New",
-                0xE710,
-                vec![Run(self, "Folder", 0xE8F4, Command::NewFolder), Run(self, "Text document", 0xE8A5, Command::NewFile)],
-            ));
+            Entries.push(Run(self, "New folder", 0xE8F4, Command::NewFolder));
+            Entries.push(Run(self, "New text document", 0xE8A5, Command::NewFile));
+            Entries.push(MenuEntry::Separator());
             Entries.push(Run(self, "Paste", 0xE77F, Command::Paste).Enable(crate::Platform::Clipboard::HasFiles()));
             Entries.push(Run(self, "Undo", 0xE7A7, Command::Undo));
             Entries.push(Run(self, "Redo", 0xE7A6, Command::Redo));

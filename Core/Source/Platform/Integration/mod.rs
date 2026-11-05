@@ -1,11 +1,12 @@
 use crate::FileSystem::{Location, WideString};
 use std::path::{Path, PathBuf};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LPARAM, WIN32_ERROR, WPARAM};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WIN32_ERROR, WPARAM};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW};
 use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
-use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_COPYDATA};
-use windows::core::{PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_COPYDATA};
+use windows::core::{Owned, PCWSTR, PWSTR, w};
 
 pub const ForwardSignature: usize = 0x464C5558;
 
@@ -188,13 +189,32 @@ fn NotifyShell() {
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
-pub fn ForwardToRunningInstance(Target: &str) -> bool {
-    let Ok(Window) = (unsafe { FindWindowW(w!("FluxMainWindow"), PCWSTR::null()) }) else { return false };
-    let mut Process = 0u32;
-    unsafe { GetWindowThreadProcessId(Window, Some(&mut Process)) };
-    if Process != 0 {
-        let _ = unsafe { AllowSetForegroundWindow(Process) };
+fn ProcessImage(Process: u32) -> Option<PathBuf> {
+    let Handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, Process) }.ok()?;
+    let Handle = unsafe { Owned::new(Handle) };
+    let mut Buffer = vec![0u16; 32768];
+    let mut Length = Buffer.len() as u32;
+    unsafe { QueryFullProcessImageNameW(*Handle, PROCESS_NAME_WIN32, PWSTR(Buffer.as_mut_ptr()), &mut Length) }.ok()?;
+    Some(crate::FileSystem::PathFromWide(&Buffer[..Length as usize]))
+}
+
+fn SameInstanceWindow() -> Option<(HWND, u32)> {
+    let Own = std::env::current_exe().ok()?;
+    let mut After: Option<HWND> = None;
+    loop {
+        let Window = unsafe { FindWindowExW(None, After, w!("FluxMainWindow"), PCWSTR::null()) }.ok()?;
+        let mut Process = 0u32;
+        unsafe { GetWindowThreadProcessId(Window, Some(&mut Process)) };
+        if Process != 0 && ProcessImage(Process).is_some_and(|Image| crate::FileSystem::SamePath(&Image, &Own)) {
+            return Some((Window, Process));
+        }
+        After = Some(Window);
     }
+}
+
+pub fn ForwardToRunningInstance(Target: &str) -> bool {
+    let Some((Window, Process)) = SameInstanceWindow() else { return false };
+    let _ = unsafe { AllowSetForegroundWindow(Process) };
     let Payload: Vec<u16> = Target.encode_utf16().collect();
     let Data = COPYDATASTRUCT { dwData: ForwardSignature, cbData: (Payload.len() * 2) as u32, lpData: Payload.as_ptr() as *mut _ };
     let mut Answer = 0usize;

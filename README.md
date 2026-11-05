@@ -26,6 +26,7 @@ Flux is built to replace File Explorer as your everyday file manager. Folders op
 - Copy, move, rename, new folder and new file, all undoable (Ctrl+Z / Ctrl+Y)
 - Delete to the Recycle Bin by default; conflicts are never resolved by silent overwrite
 - Cut, copy and paste with Explorer and other apps, and drag and drop in both directions
+- Drop onto folders, breadcrumb segments, tabs and sidebar items to move or copy there; drop onto archives, programs and shortcuts to hand the files to them, as in Explorer
 - Copy to or move to the other pane (F7 / F8)
 
 **Right-click anywhere**

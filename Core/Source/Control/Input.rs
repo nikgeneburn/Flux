@@ -6,7 +6,7 @@ use crate::FileSystem::Sorting::{Fold, StartsWithFolded};
 use crate::Interface::FileView;
 use crate::Interface::Widgets::{EditOutcome, OffsetForThumb};
 use crate::Interface::{Hit, Splitter};
-use crate::Platform::Clipboard::DragDrop::{DropPhase, DropRequest};
+use crate::Platform::Clipboard::DragDrop::{DropAnswer, DropPhase, DropRequest};
 use crate::Platform::Clipboard::{EffectCopy, EffectMove};
 use crate::Platform::{self, Modifiers};
 use crate::Services::Config::ColumnKind;
@@ -173,7 +173,6 @@ impl App {
                 true
             }
             EditOutcome::Cancel => {
-                self.Panes[Pane].Editing = false;
                 self.Panes[Pane].Completions.clear();
                 self.Focus = Focus::List;
                 true
@@ -189,7 +188,6 @@ impl App {
 
     pub fn SubmitAddress(&mut self, Pane: usize) {
         let Text = self.Panes[Pane].Address.Value();
-        self.Panes[Pane].Editing = false;
         self.Panes[Pane].Completions.clear();
         self.Focus = Focus::List;
         let Trimmed = Text.trim();
@@ -334,6 +332,7 @@ impl App {
 
     pub fn OnMouseDown(&mut self, Button: u8, X: f32, Y: f32, Double: bool) {
         let (Target, Area) = self.Hits.Find(X, Y);
+        let EditingBefore = (self.Focus == Focus::Address).then_some(self.ActivePane);
         let (Control, Shift, _) = Modifiers();
         self.Pointer.X = X;
         self.Pointer.Y = Y;
@@ -349,9 +348,8 @@ impl App {
             self.CommitRename();
         }
         let Pane = self.ActivePane;
-        if self.Focus == Focus::Address && !matches!(Target, Hit::Address { .. } | Hit::Completion { .. } | Hit::Overlay) {
-            self.Panes[Pane].Editing = false;
-            self.Panes[Pane].Completions.clear();
+        if let Some(Editing) = EditingBefore.filter(|_| !matches!(Target, Hit::Address { .. } | Hit::Completion { .. } | Hit::Overlay)) {
+            self.Panes[Editing].Completions.clear();
             self.Focus = Focus::List;
         }
         if self.Focus == Focus::Filter && !matches!(Target, Hit::Filter { .. }) && self.Overlay.is_none() {
@@ -380,7 +378,7 @@ impl App {
             (0, Hit::TabStrip { Pane: StripPane }) if Double => self.Execute(if StripPane as usize == Pane { Command::NewTab } else { Command::NewTab }),
             (0, Hit::Address { Pane: AddressPane }) => {
                 let AddressPane = AddressPane as usize;
-                if !self.Panes[AddressPane].Editing {
+                if EditingBefore != Some(AddressPane) {
                     self.ActivePane = AddressPane;
                     self.Execute(Command::FocusAddress);
                 } else if Double {
@@ -790,11 +788,12 @@ impl App {
         self.Invalidate();
     }
 
-    pub fn OnDrop(&mut self, Request: &DropRequest) -> u32 {
+    pub fn OnDrop(&mut self, Request: &DropRequest, Commit: bool) -> DropAnswer {
+        let Refuse = DropAnswer { Effect: 0, Shell: None };
         if Request.Phase == DropPhase::Leave {
             self.DropHover = None;
             self.Invalidate();
-            return 0;
+            return Refuse;
         }
         let Scale = self.Scale();
         let (X, Y) = (Request.X as f32 / Scale, Request.Y as f32 / Scale);
@@ -804,7 +803,17 @@ impl App {
         match Target {
             Hit::List { Pane } => {
                 let Pane = Pane as usize;
-                let Over = FileView::HitItem(self, Pane, X, Y).map(|Position| self.Tab(Pane).Order[Position]).filter(|&Index| self.Tab(Pane).Listing.IsDirectory(Index));
+                let Under = FileView::HitItem(self, Pane, X, Y).map(|Position| self.Tab(Pane).Order[Position]);
+                let Over = Under.filter(|&Index| self.Tab(Pane).Listing.IsDirectory(Index));
+                if let Some(Index) = Under.filter(|_| Over.is_none()) {
+                    let Item = self.Tab(Pane).Listing.FullPath(Index);
+                    let Dragged = Request.Items.iter().any(|Source| crate::FileSystem::SamePath(Source, &Item));
+                    if !Dragged && crate::Platform::Clipboard::DragDrop::AcceptsDrops(self.Window, &Item) {
+                        self.DropHover = if Request.Phase == DropPhase::Drop { None } else { Some(DropHover::List { Pane, Target: Some(Index) }) };
+                        self.Invalidate();
+                        return DropAnswer { Effect: 0, Shell: Some(Item) };
+                    }
+                }
                 Destination = match Over {
                     Some(Index) => Some(self.Tab(Pane).Listing.FullPath(Index)),
                     None => self.CurrentDirectory(Pane).filter(|_| matches!(self.Tab(Pane).Location, Location::Directory(_))),
@@ -829,14 +838,14 @@ impl App {
             }
             _ => {}
         }
-        self.DropHover = Hover;
+        self.DropHover = if Request.Phase == DropPhase::Drop { None } else { Hover };
         self.Invalidate();
-        let Some(Destination) = Destination else { return 0 };
+        let Some(Destination) = Destination else { return Refuse };
         if Request.Items.iter().any(|Item| crate::FileSystem::IsSameOrInside(&Destination, Item)) {
-            return 0;
+            return Refuse;
         }
         if Request.Items.iter().all(|Item| Item.parent().is_some_and(|Folder| crate::FileSystem::SamePath(Folder, &Destination))) {
-            return 0;
+            return Refuse;
         }
         let SameVolume = Request.Items.first().is_some_and(|Item| VolumeOf(Item) == VolumeOf(&Destination));
         let Control = Request.Keys & 0x8 != 0;
@@ -851,15 +860,12 @@ impl App {
             EffectCopy
         };
         let Effect = if Request.Allowed & Wanted != 0 { Wanted } else if Request.Allowed & EffectCopy != 0 { EffectCopy } else { 0 };
-        if Request.Phase == DropPhase::Drop {
-            self.DropHover = None;
-            if Effect != 0 {
-                let Move = Effect == EffectMove;
-                self.DropInto(Request.Items.to_vec(), Destination, Move);
-                return if Move { 0 } else { Effect };
-            }
+        if Commit && Effect != 0 {
+            let Move = Effect == EffectMove;
+            self.DropInto(Request.Items.to_vec(), Destination, Move);
+            return DropAnswer { Effect: if Move { 0 } else { Effect }, Shell: None };
         }
-        Effect
+        DropAnswer { Effect, Shell: None }
     }
 
     fn ActivateSidebarRow(&mut self, Row: usize, NewTab: bool) {

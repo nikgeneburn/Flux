@@ -298,6 +298,10 @@ impl Renderer {
         }
     }
 
+    pub fn PixelSize(&self) -> (u32, u32) {
+        (self.PixelWidth, self.PixelHeight)
+    }
+
     pub fn Resize(&mut self, Width: u32, Height: u32) {
         self.PixelWidth = Width;
         self.PixelHeight = Height;

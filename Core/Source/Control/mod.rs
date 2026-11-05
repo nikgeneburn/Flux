@@ -26,6 +26,10 @@ impl App {
         self.Panes[Pane].Current()
     }
 
+    pub fn EditingAddress(&self, Pane: usize) -> bool {
+        self.Focus == Focus::Address && self.ActivePane == Pane
+    }
+
     pub fn TabMut(&mut self, Pane: usize) -> &mut Tab {
         self.Panes[Pane].CurrentMut()
     }
@@ -68,7 +72,6 @@ impl App {
         Tab.Filter.Clear();
         Tab.FilterQuery = None;
         let Index = self.Panes[Pane].Active;
-        self.Panes[Pane].Editing = false;
         self.Panes[Pane].Completions.clear();
         if self.Focus == Focus::Address || self.Focus == Focus::Filter {
             self.Focus = Focus::List;
@@ -480,7 +483,9 @@ impl App {
             self.CancelRename();
             self.Panes[Pane].Active = Index;
             self.ActivePane = Pane;
-            self.Panes[Pane].Editing = false;
+            if self.Focus == Focus::Address {
+                self.Focus = Focus::List;
+            }
             self.RequestFreeSpace(Pane);
             self.WatchFolderSizes(Pane);
             self.RefreshInspector();
@@ -618,7 +623,6 @@ impl App {
                     _ => String::new(),
                 };
                 let Target = &mut self.Panes[Pane];
-                Target.Editing = true;
                 Target.Address.SetText(&Text);
                 self.Panes[Pane].Address.SelectAll();
                 self.Panes[Pane].Completions.clear();

@@ -473,7 +473,7 @@ pub fn OverlayWheel(App: &mut App, Delta: f32) {
 
 fn DrawCompletions(App: &mut App) {
     let Pane = App.ActivePane;
-    if !(App.Panes[Pane].Editing && App.Focus == Focus::Address) || App.Panes[Pane].Completions.is_empty() {
+    if !App.EditingAddress(Pane) || App.Panes[Pane].Completions.is_empty() {
         return;
     }
     let Some(Field) = App.Hits.AreaOf(Hit::Address { Pane: Pane as u8 }) else { return };

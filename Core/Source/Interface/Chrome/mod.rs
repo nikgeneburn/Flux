@@ -273,9 +273,9 @@ fn DrawToolbar(App: &mut App, Pane: usize, Area: Rect) {
     let FilterWidth = (Remaining.Width() * 0.3).clamp(120.0, 260.0);
     let FilterArea = Remaining.TakeRight(FilterWidth);
     Remaining.TakeRight(6.0);
-    let Editing = App.Panes[Pane].Editing;
+    let Editing = App.EditingAddress(Pane);
     if Editing {
-        let Focused = App.Focus == Focus::Address && App.ActivePane == Pane;
+        let Focused = Editing;
         App.Panes[Pane].Address.Draw(&mut App.Draw, &Look, Remaining, Focused, "Type a path, %VARIABLE% or \\\\server\\share");
         App.Hits.Push(Remaining, Hit::Address { Pane: Pane as u8 });
     } else {

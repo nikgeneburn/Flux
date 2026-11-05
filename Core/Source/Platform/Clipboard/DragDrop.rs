@@ -1,6 +1,6 @@
 use super::FilesFromDrop;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{GlobalFree, HWND, POINT, POINTL, S_OK};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
@@ -10,8 +10,47 @@ use windows::Win32::System::Ole::{
     ReleaseStgMedium, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Shell::{CLSID_DragDropHelper, HDROP, IDropTargetHelper, SHDoDragDrop};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{CLSID_DragDropHelper, HDROP, IDropTargetHelper, IShellFolder, SHBindToParent, SHDoDragDrop};
 use windows::core::{Ref, implement};
+
+pub struct DropAnswer {
+    pub Effect: u32,
+    pub Shell: Option<PathBuf>,
+}
+
+thread_local! {
+    static Probe: RefCell<Option<(PathBuf, Option<IDropTarget>)>> = const { RefCell::new(None) };
+}
+
+fn ItemDropTarget(Window: HWND, Item: &Path) -> Option<IDropTarget> {
+    let Pidl = crate::Platform::Shell::ParsePidl(Item)?;
+    let mut Last: *mut ITEMIDLIST = std::ptr::null_mut();
+    let Parent: IShellFolder = unsafe { SHBindToParent(Pidl.0, Some(&mut Last)) }.ok()?;
+    unsafe { Parent.GetUIObjectOf::<IDropTarget>(Window, &[Last as *const ITEMIDLIST], None) }.ok()
+}
+
+fn Probed(Window: HWND, Item: &Path) -> Option<IDropTarget> {
+    Probe.with(|Slot| {
+        let mut Slot = Slot.borrow_mut();
+        if let Some((Known, Target)) = Slot.as_ref() {
+            if Known == Item {
+                return Target.clone();
+            }
+        }
+        let Target = ItemDropTarget(Window, Item);
+        *Slot = Some((Item.to_path_buf(), Target.clone()));
+        Target
+    })
+}
+
+pub fn AcceptsDrops(Window: HWND, Item: &Path) -> bool {
+    Probed(Window, Item).is_some()
+}
+
+fn Forget() {
+    Probe.with(|Slot| Slot.borrow_mut().take());
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropPhase {
@@ -35,6 +74,8 @@ struct DropTarget {
     Window: HWND,
     Helper: Option<IDropTargetHelper>,
     Items: RefCell<Vec<PathBuf>>,
+    Data: RefCell<Option<IDataObject>>,
+    Entered: RefCell<Option<(PathBuf, IDropTarget)>>,
 }
 
 fn ReadItems(Object: &IDataObject) -> Vec<PathBuf> {
@@ -54,16 +95,65 @@ fn ReadItems(Object: &IDataObject) -> Vec<PathBuf> {
 
 impl DropTarget {
     fn Ask(&self, Phase: DropPhase, Keys: MODIFIERKEYS_FLAGS, Point: &POINTL, Effect: *mut DROPEFFECT) {
+        if Effect.is_null() {
+            return;
+        }
         let mut Client = POINT { x: Point.x, y: Point.y };
         unsafe {
             let _ = ScreenToClient(self.Window, &mut Client);
         }
-        let Allowed = if Effect.is_null() { 0 } else { unsafe { (*Effect).0 } };
-        let Items = self.Items.borrow();
+        let Allowed = unsafe { (*Effect).0 };
+        let Items = self.Items.borrow().clone();
+        if Items.is_empty() {
+            unsafe { *Effect = DROPEFFECT_NONE };
+            return;
+        }
         let Request = DropRequest { Phase, X: Client.x, Y: Client.y, Keys: Keys.0, Allowed, Items: &Items };
-        let Chosen = if Items.is_empty() { 0 } else { crate::Application::DropFeedback(&Request) };
-        if !Effect.is_null() {
-            unsafe { *Effect = DROPEFFECT(Chosen & Allowed) };
+        let Answer = crate::Application::DropFeedback(&Request);
+        if self.Forward(Phase, Answer.Shell, Keys, Point, Effect, Allowed) {
+            return;
+        }
+        let Chosen = if Phase == DropPhase::Drop { crate::Application::DropCommit(&Request) } else { Answer.Effect };
+        unsafe { *Effect = DROPEFFECT(Chosen & Allowed) };
+    }
+
+    fn Forward(&self, Phase: DropPhase, Shell: Option<PathBuf>, Keys: MODIFIERKEYS_FLAGS, Point: &POINTL, Effect: *mut DROPEFFECT, Allowed: u32) -> bool {
+        let Some(Item) = Shell else {
+            self.LeaveForward();
+            return false;
+        };
+        let Some(Data) = self.Data.borrow().clone() else { return false };
+        let Current = self.Entered.borrow().as_ref().filter(|(Known, _)| *Known == Item).map(|(_, Target)| Target.clone());
+        unsafe { *Effect = DROPEFFECT(Allowed) };
+        let Target = match Current {
+            Some(Target) => {
+                if Phase != DropPhase::Drop {
+                    let _ = unsafe { Target.DragOver(Keys, *Point, Effect) };
+                }
+                Target
+            }
+            None => {
+                self.LeaveForward();
+                let Some(Target) = Probed(self.Window, &Item) else { return false };
+                let _ = unsafe { Target.DragEnter(&Data, Keys, *Point, Effect) };
+                *self.Entered.borrow_mut() = Some((Item, Target.clone()));
+                Target
+            }
+        };
+        if Phase == DropPhase::Drop {
+            self.Entered.borrow_mut().take();
+            unsafe { *Effect = DROPEFFECT(Allowed) };
+            if unsafe { Target.Drop(&Data, Keys, *Point, Effect) }.is_err() {
+                unsafe { *Effect = DROPEFFECT_NONE };
+            }
+        }
+        true
+    }
+
+    fn LeaveForward(&self) {
+        let Previous = self.Entered.borrow_mut().take();
+        if let Some((_, Target)) = Previous {
+            let _ = unsafe { Target.DragLeave() };
         }
     }
 }
@@ -71,6 +161,7 @@ impl DropTarget {
 impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(&self, Object: Ref<IDataObject>, Keys: MODIFIERKEYS_FLAGS, Point: &POINTL, Effect: *mut DROPEFFECT) -> windows::core::Result<()> {
         *self.Items.borrow_mut() = Object.ok().map(ReadItems).unwrap_or_default();
+        *self.Data.borrow_mut() = Object.ok().ok().cloned();
         self.Ask(DropPhase::Enter, Keys, Point, Effect);
         if let (Some(Helper), Ok(Data)) = (&self.Helper, Object.ok()) {
             let Screen = POINT { x: Point.x, y: Point.y };
@@ -93,6 +184,9 @@ impl IDropTarget_Impl for DropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        self.LeaveForward();
+        Forget();
+        *self.Data.borrow_mut() = None;
         let Items = std::mem::take(&mut *self.Items.borrow_mut());
         let Request = DropRequest { Phase: DropPhase::Leave, X: 0, Y: 0, Keys: 0, Allowed: 0, Items: &Items };
         crate::Application::DropFeedback(&Request);
@@ -107,6 +201,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
     fn Drop(&self, Object: Ref<IDataObject>, Keys: MODIFIERKEYS_FLAGS, Point: &POINTL, Effect: *mut DROPEFFECT) -> windows::core::Result<()> {
         if let Ok(Data) = Object.ok() {
             *self.Items.borrow_mut() = ReadItems(Data);
+            *self.Data.borrow_mut() = Some(Data.clone());
         }
         self.Ask(DropPhase::Drop, Keys, Point, Effect);
         if let (Some(Helper), Ok(Data)) = (&self.Helper, Object.ok()) {
@@ -116,13 +211,15 @@ impl IDropTarget_Impl for DropTarget_Impl {
             }
         }
         self.Items.borrow_mut().clear();
+        *self.Data.borrow_mut() = None;
+        Forget();
         Ok(())
     }
 }
 
 pub fn Register(Window: HWND) -> bool {
     let Helper: Option<IDropTargetHelper> = unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
-    let Target: IDropTarget = DropTarget { Window, Helper, Items: RefCell::new(Vec::new()) }.into();
+    let Target: IDropTarget = DropTarget { Window, Helper, Items: RefCell::new(Vec::new()), Data: RefCell::new(None), Entered: RefCell::new(None) }.into();
     unsafe { RegisterDragDrop(Window, &Target) }.is_ok()
 }
 

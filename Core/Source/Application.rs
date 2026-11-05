@@ -184,8 +184,12 @@ pub fn CaptionTest(Window: HWND, X: i32, Y: i32) -> u32 {
     .unwrap_or(HTCLIENT)
 }
 
-pub fn DropFeedback(Request: &DropRequest) -> u32 {
-    WithApp(|App| App.OnDrop(Request)).unwrap_or(0)
+pub fn DropFeedback(Request: &DropRequest) -> crate::Platform::Clipboard::DragDrop::DropAnswer {
+    WithApp(|App| App.OnDrop(Request, false)).unwrap_or(crate::Platform::Clipboard::DragDrop::DropAnswer { Effect: 0, Shell: None })
+}
+
+pub fn DropCommit(Request: &DropRequest) -> u32 {
+    WithApp(|App| App.OnDrop(Request, true).Effect).unwrap_or(0)
 }
 
 pub fn Dispatch(Window: HWND, Message: u32, WParameter: WPARAM, LParameter: LPARAM) -> Option<LRESULT> {
@@ -441,11 +445,7 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_SIZE => {
-                let Width = (LParameter.0 & 0xFFFF) as u32;
-                let Height = ((LParameter.0 >> 16) & 0xFFFF) as u32;
-                self.Draw.Resize(Width, Height);
-                self.Width = Width as f32 / Scale;
-                self.Height = Height as f32 / Scale;
+                self.SyncSize();
                 self.Invalidate();
                 Some(LRESULT(0))
             }
@@ -645,9 +645,23 @@ impl App {
         }
     }
 
+    fn SyncSize(&mut self) {
+        let (Width, Height) = Platform::ClientSize(self.Window);
+        if Width == 0 || Height == 0 {
+            return;
+        }
+        if self.Draw.PixelSize() != (Width, Height) {
+            self.Draw.Resize(Width, Height);
+        }
+        let Scale = self.Scale();
+        self.Width = Width as f32 / Scale;
+        self.Height = Height as f32 / Scale;
+    }
+
     fn Paint(&mut self) {
         let mut Paint = PAINTSTRUCT::default();
         unsafe { BeginPaint(self.Window, &mut Paint) };
+        self.SyncSize();
         let Started = Instant::now();
         self.Media.BeginFrame(&self.Draw);
         self.Motion.BeginFrame();
