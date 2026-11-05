@@ -50,6 +50,8 @@ pub enum Event {
     Module(ModuleEvent),
     ShellMenu(crate::Platform::Menus::Extensions::ShellMenuUpdate),
     FolderSizes(Vec<(PathBuf, crate::FileSystem::Sizes::FolderSize)>),
+    Reveal(PathBuf, bool),
+    Update(crate::Services::Update::UpdateEvent),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,6 +92,8 @@ pub enum Deferred {
     RunAs(PathBuf),
     PickModuleFolder,
     TestCrash,
+    PasteShell(PathBuf),
+    DropShell { Sources: Vec<PathBuf>, Destination: PathBuf, Moving: bool },
 }
 
 pub struct Notice {
@@ -156,6 +160,10 @@ pub struct App {
     pub ScrollTimer: bool,
     pub PerformanceTimer: bool,
     pub Bench: Option<crate::Services::Performance::UiBenchmark>,
+    pub Updating: bool,
+    pub PendingUpdate: Option<crate::Services::Update::Release>,
+    pub Relaunch: Option<PathBuf>,
+    pub ShellFresh: bool,
     pub Motion: Motion,
     pub Logo: Option<(u64, u32, windows::Win32::Graphics::Direct2D::ID2D1Bitmap)>,
 }
@@ -192,6 +200,10 @@ pub fn DropCommit(Request: &DropRequest) -> u32 {
     WithApp(|App| App.OnDrop(Request, true).Effect).unwrap_or(0)
 }
 
+pub fn AfterShellDrop() {
+    WithApp(|App| App.ReloadArchives(None));
+}
+
 pub fn Dispatch(Window: HWND, Message: u32, WParameter: WPARAM, LParameter: LPARAM) -> Option<LRESULT> {
     if let Some(Result) = Platform::Menus::RouteMenuMessage(Message, WParameter, LParameter) {
         return Some(Result);
@@ -202,6 +214,17 @@ pub fn Dispatch(Window: HWND, Message: u32, WParameter: WPARAM, LParameter: LPAR
     }
     let Result = WithApp(|App| App.OnMessage(Message, WParameter, LParameter)).flatten();
     RunDeferred(Window);
+    if let Some((Folder, Fresh)) = WithApp(|App| (App.ShellFolder(), App.ShellFresh)) {
+        match Platform::Browser::Navigate(Folder.as_deref(), Fresh) {
+            Platform::Browser::Report::Done if Fresh => {
+                WithApp(|App| App.ShellFresh = false);
+            }
+            Platform::Browser::Report::Later => unsafe {
+                let _ = PostMessageW(Some(Window), WakeMessage, WPARAM(0), LPARAM(0));
+            },
+            _ => {}
+        }
+    }
     Result
 }
 
@@ -251,6 +274,24 @@ fn RunDeferred(Window: HWND) {
                     }
                 }
                 Deferred::TestCrash => crate::Services::Diagnostics::TriggerTestCrash(),
+                Deferred::PasteShell(Directory) => {
+                    let Result = Platform::Clipboard::PasteShell(Window, &Directory);
+                    WithApp(|App| {
+                        if let Err(Message) = Result {
+                            App.Fail("Paste failed", &Message);
+                        }
+                        App.ReloadArchives(None);
+                    });
+                }
+                Deferred::DropShell { Sources, Destination, Moving } => {
+                    let Result = Platform::Clipboard::DropFiles(Window, &Sources, &Destination, Moving);
+                    WithApp(|App| {
+                        if let Err(Message) = Result {
+                            App.Fail(if Moving { "Move failed" } else { "Copy failed" }, &Message);
+                        }
+                        App.ReloadArchives(None);
+                    });
+                }
             }
         }
         Platform::Invalidate(Window);
@@ -283,13 +324,27 @@ pub fn Run(Arguments: &[String]) -> i32 {
         WithApp(|App| App.OpenExternal(&Text));
     }
     Platform::Show(Window, Maximized);
+    let Benchmarking = WithApp(|App| App.Bench.is_some()).unwrap_or(false);
+    if !Benchmarking && Platform::Integration::FluxIsDefault() {
+        if let Some(Sink) = WithApp(|App| App.Sink.clone()) {
+            Platform::Browser::Register(Window, Sink);
+        }
+    }
+    if !Benchmarking {
+        WithApp(|App| App.StartUpdates());
+    }
     let Code = Platform::RunMessageLoop();
+    Platform::Browser::Unregister();
     let Exit = WithApp(|App| App.Bench.as_ref().map(|Bench| Bench.ExitCode)).flatten();
+    let Relaunch = WithApp(|App| App.Relaunch.take()).flatten();
     Instance.with(|Slot| {
         if let Ok(mut Guard) = Slot.try_borrow_mut() {
             Guard.take();
         }
     });
+    if let Some(Executable) = Relaunch {
+        let _ = std::process::Command::new(Executable).spawn();
+    }
     Exit.unwrap_or(Code)
 }
 
@@ -352,6 +407,10 @@ impl App {
             ScrollTimer: false,
             PerformanceTimer: false,
             Bench,
+            Updating: false,
+            PendingUpdate: None,
+            Relaunch: None,
+            ShellFresh: false,
             Motion: Motion::New(Settings.Animations),
             Logo: None,
             Theme: Look,
@@ -626,6 +685,7 @@ impl App {
                 }
                 self.Invalidate();
             }
+            Platform::TimerUpdate => self.UpdateTick(),
             Platform::TimerPerformance => {
                 self.Performance.Sample(self.Media.CacheBytes());
                 if self.BenchTick() {
@@ -788,6 +848,11 @@ impl App {
             Event::Module(Update) => self.OnModuleEvent(Update),
             Event::ShellMenu(Update) => self.AcceptShellMenu(Update),
             Event::FolderSizes(Results) => self.AcceptFolderSizes(Results),
+            Event::Update(Outcome) => self.OnUpdate(Outcome),
+            Event::Reveal(Item, Keep) => {
+                self.RevealItem(&Item, Keep);
+                Platform::Activate(self.Window);
+            }
         }
     }
 

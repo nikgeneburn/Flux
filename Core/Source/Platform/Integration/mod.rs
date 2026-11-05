@@ -4,7 +4,9 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPAR
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW};
-use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{GPFIDL_DEFAULT, SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHGetPathFromIDListEx, SHParseDisplayName};
 use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_COPYDATA};
 use windows::core::{Owned, PCWSTR, PWSTR, w};
 
@@ -21,8 +23,12 @@ const BackgroundVerb: &str = "Software\\Classes\\Directory\\Background\\shell\\F
 const BackgroundCommand: &str = "Software\\Classes\\Directory\\Background\\shell\\Flux\\command";
 const NewWindowShell: &str = "Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell";
 const NewWindowClass: &str = "Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+const ArchiveCommand: &str = "Software\\Classes\\CompressedFolder\\shell\\Open\\command";
+const ArchiveVerb: &str = "Software\\Classes\\CompressedFolder\\shell\\Open";
+const ArchiveShell: &str = "Software\\Classes\\CompressedFolder\\shell";
+const ArchiveClass: &str = "Software\\Classes\\CompressedFolder";
 
-const TakenValues: [(&str, &str); 7] = [
+const TakenValues: [(&str, &str); 9] = [
     (DirectoryShell, ""),
     (DirectoryCommand, ""),
     (DirectoryCommand, "DelegateExecute"),
@@ -30,6 +36,8 @@ const TakenValues: [(&str, &str); 7] = [
     (DriveCommand, ""),
     (DriveCommand, "DelegateExecute"),
     (NewWindowCommand, ""),
+    (ArchiveCommand, ""),
+    (ArchiveCommand, "DelegateExecute"),
 ];
 
 fn ValueName(Name: &str) -> Option<Vec<u16>> {
@@ -75,9 +83,12 @@ fn DeleteValue(Key: &str, Name: &str) -> Result<(), String> {
     if Status == ERROR_SUCCESS || Status == ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(Describe(Key, Status)) }
 }
 
+pub fn FluxIsDefault() -> bool {
+    ReadString(DirectoryCommand, "").ok().flatten().unwrap_or_default().to_ascii_lowercase().contains("\\flux.exe\"")
+}
+
 pub fn ApplyTaskbarIdentity() {
-    let Registered = ReadString(DirectoryCommand, "").ok().flatten().unwrap_or_default().to_ascii_lowercase();
-    if Registered.contains("\\flux.exe\"") {
+    if FluxIsDefault() {
         let _ = unsafe { windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(w!("Microsoft.Windows.Explorer")) };
     }
 }
@@ -125,14 +136,17 @@ pub fn IsRegistered(Executable: &Path) -> bool {
 }
 
 pub fn Register(Executable: &Path) -> Result<(), String> {
-    if ReadString(BackupKey, "Registered")?.is_none() {
-        for (Key, Name) in TakenValues {
+    let First = ReadString(BackupKey, "Registered")?.is_none();
+    for (Key, Name) in TakenValues {
+        if First || ReadString(BackupKey, &BackupName(Key, Name))?.is_none() {
             let Saved = match ReadString(Key, Name)? {
                 Some(Text) => format!("1{Text}"),
                 None => "0".to_string(),
             };
             WriteString(BackupKey, &BackupName(Key, Name), &Saved)?;
         }
+    }
+    if First {
         WriteString(BackupKey, "NewWindowVerbExisted", if ReadString(NewWindowVerb, "")?.is_some() || ReadString(NewWindowCommand, "")?.is_some() { "1" } else { "0" })?;
         WriteString(BackupKey, "Registered", "1")?;
     }
@@ -148,6 +162,8 @@ pub fn Register(Executable: &Path) -> Result<(), String> {
     WriteString(BackgroundVerb, "", "Open in Flux")?;
     WriteString(BackgroundVerb, "Icon", &Executable.display().to_string())?;
     WriteString(BackgroundCommand, "", &CommandFor(Executable, "%V"))?;
+    WriteString(ArchiveCommand, "", &Open)?;
+    WriteString(ArchiveCommand, "DelegateExecute", "")?;
     NotifyShell();
     Ok(())
 }
@@ -172,13 +188,13 @@ pub fn Unregister() -> Result<(), String> {
         }
         DeleteTree(NewWindowVerb)?;
     }
-    for Key in [DirectoryCommand, DriveCommand] {
+    for Key in [DirectoryCommand, DriveCommand, ArchiveCommand] {
         if ReadString(Key, "")?.is_none() {
             DeleteValue(Key, "DelegateExecute")?;
         }
     }
     DeleteTree(BackgroundVerb)?;
-    for Key in [DirectoryCommand, "Software\\Classes\\Directory\\shell\\open", DriveCommand, "Software\\Classes\\Drive\\shell\\open", NewWindowCommand, NewWindowVerb, NewWindowShell, NewWindowClass, DirectoryShell, DriveShell] {
+    for Key in [DirectoryCommand, "Software\\Classes\\Directory\\shell\\open", DriveCommand, "Software\\Classes\\Drive\\shell\\open", NewWindowCommand, NewWindowVerb, NewWindowShell, NewWindowClass, DirectoryShell, DriveShell, ArchiveCommand, ArchiveVerb, ArchiveShell, ArchiveClass] {
         DeleteIfEmpty(Key);
     }
     NotifyShell();
@@ -248,12 +264,25 @@ pub fn StartupTarget(Arguments: &[String]) -> Option<String> {
 }
 
 pub fn ForwardText(Arguments: &[String]) -> String {
-    match StartupTarget(Arguments).and_then(|Text| ResolveTarget(&Text)) {
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let Raw = StartupTarget(Arguments).unwrap_or_default();
+    match ResolveTarget(&Raw) {
         Some((Location::Computer, _)) => "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string(),
         Some((Location::Directory(_), Some(Item))) => format!("/select,{}", Item.display()),
         Some((Location::Directory(Folder), None)) => Folder.display().to_string(),
-        _ => String::new(),
+        _ => Raw,
     }
+}
+
+fn ShellFolderPath(Text: &str) -> Option<PathBuf> {
+    let Wide: Vec<u16> = Text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut Pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    unsafe { SHParseDisplayName(PCWSTR(Wide.as_ptr()), None, &mut Pidl, 0, None) }.ok()?;
+    let mut Buffer = vec![0u16; 32768];
+    let Found = unsafe { SHGetPathFromIDListEx(Pidl, &mut Buffer, GPFIDL_DEFAULT) }.as_bool();
+    unsafe { CoTaskMemFree(Some(Pidl as *const _)) };
+    let Folder = crate::FileSystem::PathFromWide(&Buffer);
+    (Found && Folder.is_dir()).then_some(Folder)
 }
 
 pub fn ResolveTarget(Text: &str) -> Option<(Location, Option<PathBuf>)> {
@@ -261,8 +290,11 @@ pub fn ResolveTarget(Text: &str) -> Option<(Location, Option<PathBuf>)> {
     if Trimmed.to_ascii_uppercase().contains("20D04FE0-3AEA-1069-A2D8-08002B30309D") {
         return Some((Location::Computer, None));
     }
-    if Trimmed.is_empty() || Trimmed.starts_with("::") || Trimmed.starts_with("shell:") {
+    if Trimmed.is_empty() {
         return None;
+    }
+    if Trimmed.starts_with("::") || Trimmed.to_ascii_lowercase().starts_with("shell:") {
+        return ShellFolderPath(Trimmed).map(|Folder| (Location::Directory(Folder), None));
     }
     let Selected = Trimmed.strip_prefix("/select,").map(|Rest| Rest.trim().trim_matches('"'));
     let mut Text = Selected.unwrap_or(Trimmed).to_string();
@@ -271,6 +303,9 @@ pub fn ResolveTarget(Text: &str) -> Option<(Location, Option<PathBuf>)> {
     }
     let Candidate = PathBuf::from(Text);
     let Absolute = std::path::absolute(&Candidate).unwrap_or(Candidate);
+    if Selected.is_none() && Absolute.is_file() && crate::Platform::Shell::IsArchive(&Absolute) {
+        return Some((Location::Directory(Absolute), None));
+    }
     if Selected.is_some() || Absolute.is_file() {
         let Parent = Absolute.parent()?.to_path_buf();
         return Some((Location::Directory(Parent), Some(Absolute)));

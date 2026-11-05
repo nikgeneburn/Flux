@@ -1,5 +1,7 @@
-use super::{Code, Engine, Exists, HresultCode, Phase, Shared};
-use crate::FileSystem::{ErrorText, PathFromWide, SamePath, ShellPath};
+use super::{Code, Engine, Exists, HresultCode, Phase, Request, Shared};
+use crate::FileSystem::{ErrorText, InArchive, PathFromWide, SamePath, ShellPath};
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -10,7 +12,7 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::UI::Shell::{
-    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
+    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
     IFileOperationProgressSink, IFileOperationProgressSink_Vtbl, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR};
@@ -233,5 +235,127 @@ pub(super) fn Run(Worker: &mut Engine, Items: &[PathBuf], Owner: isize) {
                 Ok(()) => Worker.FailText(&Item, "The item was not moved to the Recycle Bin"),
             }
         }
+    }
+}
+
+fn ShellItemOf(Item: &Path) -> windows::core::Result<IShellItem> {
+    let Wide = ShellPath(Item);
+    unsafe { SHCreateItemFromParsingName(PCWSTR(Wide.as_ptr()), None) }
+}
+
+fn NameOf(Item: &Path) -> Vec<u16> {
+    Item.file_name().map(|Name| Name.encode_wide().chain(std::iter::once(0)).collect()).unwrap_or_else(|| vec![0])
+}
+
+pub(super) fn Touches(Work: &Request) -> bool {
+    let Inside = |Item: &Path| InArchive(Item);
+    match Work {
+        Request::CopyInto { Sources, .. } | Request::MoveInto { Sources, .. } => Sources.iter().any(|Item| Inside(Item)),
+        Request::MovePairs(Pairs) => Pairs.iter().any(|(From, To)| Inside(From) || Inside(To)),
+        Request::Recycle(Items) | Request::DeletePermanently(Items) => Items.iter().any(|Item| Inside(Item)),
+        Request::CreateFolder(Item) | Request::CreateFile(Item) => Inside(Item),
+    }
+}
+
+pub(super) fn Archive(Worker: &mut Engine, Work: &Request, Owner: isize) {
+    let State = Worker.State.clone();
+    State.SetPhase(Phase::Working);
+    State.Report();
+    let Initialized = unsafe { CoInitializeEx(None, COINIT(COINIT_APARTMENTTHREADED.0 | COINIT_DISABLE_OLE1DDE.0)) };
+    let _Apartment = Initialized.is_ok().then_some(Apartment);
+    let Affected: Vec<PathBuf> = match Work {
+        Request::CopyInto { Sources, .. } | Request::MoveInto { Sources, .. } => Sources.clone(),
+        Request::MovePairs(Pairs) => Pairs.iter().map(|(From, _)| From.clone()).collect(),
+        Request::Recycle(Items) | Request::DeletePermanently(Items) => Items.clone(),
+        Request::CreateFolder(Item) | Request::CreateFile(Item) => vec![Item.clone()],
+    };
+    State.AddTotals(Affected.len() as u64, 0);
+    let Shell: IFileOperation = match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) } {
+        Ok(Value) => Value,
+        Err(Error) => {
+            for Item in &Affected {
+                Worker.Fail(Item, Code(&Error));
+            }
+            return;
+        }
+    };
+    let Recycling = matches!(Work, Request::Recycle(_));
+    let Flags = FOF_ALLOWUNDO.0 | FOF_NOCONFIRMMKDIR.0 | if Recycling { FOFX_RECYCLEONDELETE.0 | FOF_WANTNUKEWARNING.0 } else { 0 };
+    if let Err(Error) = unsafe { Shell.SetOperationFlags(FILEOPERATION_FLAGS(Flags)) } {
+        for Item in &Affected {
+            Worker.Fail(Item, Code(&Error));
+        }
+        return;
+    }
+    if Owner != 0 {
+        let _ = unsafe { Shell.SetOwnerWindow(HWND(Owner as *mut c_void)) };
+    }
+    let mut Queued = 0usize;
+    let mut Queue = |Item: &Path, Result: windows::core::Result<()>, Worker: &mut Engine| match Result {
+        Ok(()) => Queued += 1,
+        Err(Error) => Worker.Fail(Item, Code(&Error)),
+    };
+    match Work {
+        Request::CopyInto { Sources, Destination } | Request::MoveInto { Sources, Destination } => {
+            let Moving = matches!(Work, Request::MoveInto { .. });
+            match ShellItemOf(Destination) {
+                Ok(Folder) => {
+                    for Source in Sources {
+                        let Result = ShellItemOf(Source).and_then(|Item| unsafe {
+                            if Moving { Shell.MoveItem(&Item, &Folder, PCWSTR::null(), None) } else { Shell.CopyItem(&Item, &Folder, PCWSTR::null(), None) }
+                        });
+                        Queue(Source, Result, Worker);
+                    }
+                }
+                Err(Error) => {
+                    for Source in Sources {
+                        Worker.Fail(Source, Code(&Error));
+                    }
+                }
+            }
+        }
+        Request::MovePairs(Pairs) => {
+            for (From, To) in Pairs {
+                let Name = NameOf(To);
+                let Result = ShellItemOf(From).and_then(|Item| unsafe {
+                    match (From.parent(), To.parent()) {
+                        (Some(Before), Some(After)) if SamePath(Before, After) => Shell.RenameItem(&Item, PCWSTR(Name.as_ptr()), None),
+                        (_, Some(After)) => ShellItemOf(After).and_then(|Folder| Shell.MoveItem(&Item, &Folder, PCWSTR(Name.as_ptr()), None)),
+                        _ => Err(windows::core::Error::from(E_POINTER)),
+                    }
+                });
+                Queue(From, Result, Worker);
+            }
+        }
+        Request::Recycle(Items) | Request::DeletePermanently(Items) => {
+            for Item in Items {
+                let Result = ShellItemOf(Item).and_then(|Target| unsafe { Shell.DeleteItem(&Target, None) });
+                Queue(Item, Result, Worker);
+            }
+        }
+        Request::CreateFolder(Item) | Request::CreateFile(Item) => {
+            let Attributes = if matches!(Work, Request::CreateFolder(_)) { 0x10 } else { 0x80 };
+            let Name = NameOf(Item);
+            let Result = Item
+                .parent()
+                .ok_or_else(|| windows::core::Error::from(E_POINTER))
+                .and_then(ShellItemOf)
+                .and_then(|Folder| unsafe { Shell.NewItem(&Folder, Attributes, PCWSTR(Name.as_ptr()), PCWSTR::null(), None) });
+            Queue(Item, Result, Worker);
+        }
+    }
+    if Queued == 0 || State.IsCancelled() {
+        return;
+    }
+    if let Err(Error) = unsafe { Shell.PerformOperations() } {
+        if Error.code() != E_ABORT {
+            Worker.Result.Errors.push((Affected.first().cloned().unwrap_or_default(), ErrorText(Code(&Error))));
+        }
+    }
+    if unsafe { Shell.GetAnyOperationsAborted() }.is_ok_and(|Value| Value.as_bool()) {
+        State.Cancelled.store(true, Ordering::Release);
+    }
+    if let Request::CreateFolder(Item) | Request::CreateFile(Item) = Work {
+        Worker.Result.Created.push(Item.clone());
     }
 }

@@ -34,9 +34,20 @@ pub fn ParsePidl(Item: &Path) -> Option<OwnedPidl> {
 }
 
 pub fn DataObject(Items: &[PathBuf]) -> Option<(IDataObject, Vec<OwnedPidl>)> {
+    use windows::Win32::UI::Shell::{ILFindLastID, IShellFolder, SHBindToParent};
     let Pidls: Vec<OwnedPidl> = Items.iter().filter_map(|Item| ParsePidl(Item)).collect();
     if Pidls.is_empty() {
         return None;
+    }
+    let Shared = Items.first().and_then(|First| First.parent()).is_some_and(|Folder| Items.iter().all(|Item| Item.parent().is_some_and(|Other| crate::FileSystem::SamePath(Other, Folder))));
+    if Shared && Pidls.len() == Items.len() {
+        let mut Last: *mut ITEMIDLIST = std::ptr::null_mut();
+        if let Ok(Parent) = unsafe { SHBindToParent::<IShellFolder>(Pidls[0].0, Some(&mut Last)) } {
+            let Children: Vec<*const ITEMIDLIST> = Pidls.iter().map(|Pidl| unsafe { ILFindLastID(Pidl.0) } as *const _).collect();
+            if let Ok(Object) = unsafe { Parent.GetUIObjectOf::<IDataObject>(HWND::default(), &Children, None) } {
+                return Some((Object, Pidls));
+            }
+        }
     }
     let Raw: Vec<*const ITEMIDLIST> = Pidls.iter().map(|Pidl| Pidl.0 as *const _).collect();
     let Object: IDataObject = unsafe { SHCreateDataObject(None, Some(&Raw), None) }.ok()?;
@@ -274,6 +285,22 @@ pub fn OpenInExplorer(Item: &Path, Select: bool) -> Result<(), String> {
         Process.arg(&Text);
     }
     Process.spawn().map(|_| ()).map_err(|Error| Error.to_string())
+}
+
+pub fn OpenInExplorerRaw(Text: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut Process = std::process::Command::new("explorer.exe");
+    if !Text.trim().is_empty() {
+        Process.raw_arg(format!("\"{}\"", Text.trim().trim_matches('"')));
+    }
+    Process.spawn().map(|_| ()).map_err(|Error| Error.to_string())
+}
+
+pub fn IsArchive(Item: &Path) -> bool {
+    use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_STREAM};
+    let Ok(Shell) = ShellItem(Item).ok_or(()) else { return false };
+    let Wanted = SFGAO_FOLDER | SFGAO_STREAM;
+    unsafe { Shell.GetAttributes(Wanted) }.is_ok_and(|Flags| Flags.0 & Wanted.0 == Wanted.0)
 }
 
 pub fn ShortcutTarget(Item: &Path) -> Option<PathBuf> {

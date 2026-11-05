@@ -188,6 +188,17 @@ impl Tab {
         }
     }
 
+    pub fn FocusName(&mut self, Name: &[u16], Keep: bool) -> bool {
+        let Some(Index) = self.Listing.Find(Name).filter(|Index| self.Order.contains(Index)) else { return false };
+        if !Keep {
+            self.ClearSelection();
+        }
+        self.SetSelected(Index, true);
+        self.Cursor = Some(Index);
+        self.Anchor = Some(Index);
+        true
+    }
+
     pub fn Append(&mut self, Chunk: &Listing, From: usize, Rules: &Visibility) {
         if self.Listing.Root.is_none() && self.Listing.Entries.is_empty() {
             self.Listing.Root = Chunk.Root.clone();

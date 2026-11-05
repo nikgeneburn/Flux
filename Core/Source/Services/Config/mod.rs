@@ -289,6 +289,9 @@ pub struct Settings {
     pub FullMemoryDump: bool,
     pub ShowPerformance: bool,
     pub TerminalCommand: String,
+    pub AutoUpdate: bool,
+    pub SkippedVersion: String,
+    pub LastUpdateCheck: u64,
 }
 
 impl Default for Settings {
@@ -327,6 +330,9 @@ impl Default for Settings {
             FullMemoryDump: false,
             ShowPerformance: false,
             TerminalCommand: String::new(),
+            AutoUpdate: true,
+            SkippedVersion: String::new(),
+            LastUpdateCheck: 0,
         }
     }
 }
@@ -398,6 +404,9 @@ impl Settings {
         Output.CrashMonitor = Data.Bool(SettingsGroup, "CrashMonitor", Output.CrashMonitor);
         Output.FullMemoryDump = Data.Bool(SettingsGroup, "FullMemoryDump", Output.FullMemoryDump);
         Output.ShowPerformance = Data.Bool(SettingsGroup, "ShowPerformance", Output.ShowPerformance);
+        Output.AutoUpdate = Data.Bool(SettingsGroup, "AutoUpdate", Output.AutoUpdate);
+        Output.SkippedVersion = Data.Get(SettingsGroup, "SkippedVersion").unwrap_or_default().to_string();
+        Output.LastUpdateCheck = Data.Get(SettingsGroup, "LastUpdateCheck").and_then(|Value| Value.trim().parse().ok()).unwrap_or(0);
         if let Some(Value) = Data.Get(SettingsGroup, "TerminalCommand") {
             Output.TerminalCommand = Value.to_string();
         }
@@ -446,6 +455,9 @@ impl Settings {
         Data.Set(SettingsGroup, "FullMemoryDump", Flag(self.FullMemoryDump));
         Data.Set(SettingsGroup, "ShowPerformance", Flag(self.ShowPerformance));
         Data.Set(SettingsGroup, "TerminalCommand", &self.TerminalCommand);
+        Data.Set(SettingsGroup, "AutoUpdate", Flag(self.AutoUpdate));
+        Data.Set(SettingsGroup, "SkippedVersion", &self.SkippedVersion);
+        Data.Set(SettingsGroup, "LastUpdateCheck", &self.LastUpdateCheck.to_string());
         Data.Save(Item)
     }
 }

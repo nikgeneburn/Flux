@@ -17,6 +17,7 @@ Flux is built to replace File Explorer as your everyday file manager. Folders op
 - True folder sizes: the Size column shows everything inside each folder, computed in the background, cached on disk, verified with per-folder content hashes and kept current by a live change watcher
 - Sidebar with collapsible Favorites, Recent and folder tree, plus drives with a blue-to-red usage bar
 - Inspector panel with previews of images, text and binary files, folder sizes and quick actions
+- Browse into zip archives like folders: open, copy out, paste or drop in, rename and delete inside them through Windows' own zip support
 
 **Finding things**
 - Instant filter as you type, recursive search of subfolders with streamed results
@@ -43,7 +44,8 @@ Flux is built to replace File Explorer as your everyday file manager. Folders op
 
 **Replaces File Explorer**
 - One switch makes Flux open folders, drives and Win+E, including from other apps
-- Folders opened from elsewhere become a new tab in the running window instead of a new process
+- Folders opened from elsewhere become a new tab in the running window instead of a new process, or switch to the tab that already shows them
+- "Show in folder" from browsers and other apps selects the file in Flux, and zip files open in Flux too
 - Shares the File Explorer taskbar button, so it never adds a slot to a full taskbar
 - Fully reversible: the original registry values are backed up and restored exactly
 
@@ -54,6 +56,7 @@ Flux is built to replace File Explorer as your everyday file manager. Folders op
 **Reliability**
 - Out-of-process crash reporter writes a minidump and a readable report with stack traces, registers, arguments and loaded modules
 - Built-in performance overlay (F12) and command-line benchmarks
+- Optional update check: when a new release is published on GitHub, Flux asks once, then downloads it, verifies its SHA-256 checksum, replaces the installation and restarts with your tabs restored
 
 ## Install
 
@@ -66,6 +69,8 @@ cd Flux
 ```
 
 This builds a release, installs it to `%LOCALAPPDATA%\Programs\Flux`, and registers Flux as the default file manager. To only build a package in `Distribution\Flux` without installing, run `.\Package.ps1`. Add `-Portable` to keep settings next to the executable.
+
+Installed release builds check GitHub for a newer release at most every 12 hours. **Update** installs it; **Not now** skips that version until the next one; **Never ask again**, or **Settings → Updates → Check for updates automatically**, turns the check off. **Check now** checks on demand.
 
 To give folders back to File Explorer, turn off **Settings → Windows integration → Default file manager**, or run:
 

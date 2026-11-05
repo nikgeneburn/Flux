@@ -31,6 +31,8 @@ enum SettingAction {
     ReuseWindow,
     FolderSizes,
     ShellInline,
+    AutoUpdate,
+    CheckUpdates,
 }
 
 enum Control {
@@ -82,6 +84,8 @@ fn Rows(App: &App) -> Vec<SettingRow> {
         Row(None, "Performance overlay", "Frame time, memory and CPU in the status bar", Control::Toggle(Settings.ShowPerformance), SettingAction::Run(Command::TogglePerformance)),
         Row(Some("Windows integration"), "Default file manager", "Open folders, drives and Win+E in Flux instead of File Explorer", Control::Toggle(IsDefaultManager()), SettingAction::DefaultManager),
         Row(None, "Open folders in existing window", "Folders opened from other apps become a new tab", Control::Toggle(Settings.ReuseWindow), SettingAction::ReuseWindow),
+        Row(Some("Updates"), "Check for updates automatically", "Ask when a new Flux release is published on GitHub", Control::Toggle(Settings.AutoUpdate), SettingAction::AutoUpdate),
+        Row(None, "Check for updates", &format!("Installed version {}", crate::Services::Update::CurrentVersion()), Control::Button("Check now"), SettingAction::CheckUpdates),
         Row(Some("Diagnostics"), "Crash reporter process", "Out-of-process crash reports (applies after restart)", Control::Toggle(Settings.CrashMonitor), SettingAction::CrashMonitor),
         Row(None, "Full memory dumps", "Larger dumps that may contain file names and contents", Control::Toggle(Settings.FullMemoryDump), SettingAction::FullDump),
         Row(None, "Crash reports", "Open the crash report folder", Control::Button("Open"), SettingAction::Crashes),
@@ -127,6 +131,17 @@ impl App {
             SettingAction::RestoreSession => self.Settings.RestoreSession = !self.Settings.RestoreSession,
             SettingAction::ReuseWindow => self.Settings.ReuseWindow = !self.Settings.ReuseWindow,
             SettingAction::ShellInline => self.Settings.ShellActionsInline = !self.Settings.ShellActionsInline,
+            SettingAction::AutoUpdate => {
+                self.Settings.AutoUpdate = !self.Settings.AutoUpdate;
+                if self.Settings.AutoUpdate {
+                    self.Settings.SkippedVersion.clear();
+                }
+            }
+            SettingAction::CheckUpdates => {
+                self.CheckForUpdates(true);
+                self.Invalidate();
+                return;
+            }
             SettingAction::FolderSizes => {
                 self.Settings.FolderSizes = !self.Settings.FolderSizes;
                 if self.Settings.FolderSizes {

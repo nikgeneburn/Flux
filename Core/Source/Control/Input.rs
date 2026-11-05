@@ -841,6 +841,9 @@ impl App {
         self.DropHover = if Request.Phase == DropPhase::Drop { None } else { Hover };
         self.Invalidate();
         let Some(Destination) = Destination else { return Refuse };
+        if Request.Items.is_empty() {
+            return DropAnswer { Effect: 0, Shell: Some(Destination) };
+        }
         if Request.Items.iter().any(|Item| crate::FileSystem::IsSameOrInside(&Destination, Item)) {
             return Refuse;
         }

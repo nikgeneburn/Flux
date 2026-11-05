@@ -49,6 +49,7 @@ pub enum PromptPurpose {
     ApproveModule(usize),
     TestCrash,
     Information,
+    Update(crate::Services::Update::Release),
 }
 
 pub struct Prompt {

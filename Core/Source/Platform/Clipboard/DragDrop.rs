@@ -30,6 +30,10 @@ fn ItemDropTarget(Window: HWND, Item: &Path) -> Option<IDropTarget> {
     unsafe { Parent.GetUIObjectOf::<IDropTarget>(Window, &[Last as *const ITEMIDLIST], None) }.ok()
 }
 
+pub fn FolderDropTarget(Window: HWND, Item: &Path) -> Option<IDropTarget> {
+    ItemDropTarget(Window, Item)
+}
+
 fn Probed(Window: HWND, Item: &Path) -> Option<IDropTarget> {
     Probe.with(|Slot| {
         let mut Slot = Slot.borrow_mut();
@@ -104,7 +108,7 @@ impl DropTarget {
         }
         let Allowed = unsafe { (*Effect).0 };
         let Items = self.Items.borrow().clone();
-        if Items.is_empty() {
+        if Items.is_empty() && self.Data.borrow().is_none() {
             unsafe { *Effect = DROPEFFECT_NONE };
             return;
         }
@@ -146,6 +150,7 @@ impl DropTarget {
             if unsafe { Target.Drop(&Data, Keys, *Point, Effect) }.is_err() {
                 unsafe { *Effect = DROPEFFECT_NONE };
             }
+            crate::Application::AfterShellDrop();
         }
         true
     }
@@ -231,7 +236,9 @@ pub fn Revoke(Window: HWND) {
 
 pub fn StartDrag(Window: HWND, Items: &[PathBuf]) -> Option<u32> {
     let (Object, _Pidls) = crate::Platform::Shell::DataObject(Items)?;
-    AttachFileList(&Object, Items);
+    if !Items.iter().any(|Item| crate::FileSystem::InArchive(Item)) {
+        AttachFileList(&Object, Items);
+    }
     let Allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
     unsafe { SHDoDragDrop(Some(Window), &Object, None, Allowed) }.ok().map(|Effect| Effect.0)
 }

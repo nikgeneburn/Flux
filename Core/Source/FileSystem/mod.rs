@@ -82,6 +82,7 @@ pub struct Listing {
     pub Entries: Vec<Entry>,
     pub Drives: Vec<DriveDetails>,
     pub RemovedCount: usize,
+    pub Archive: Option<PathBuf>,
 }
 
 pub struct RawEntry<'a> {
@@ -437,6 +438,25 @@ pub fn SamePath(Left: &Path, Right: &Path) -> bool {
     let TrimA = if A.len() > 3 && A.last() == Some(&(b'\\' as u16)) { &A[..A.len() - 1] } else { &A[..] };
     let TrimB = if B.len() > 3 && B.last() == Some(&(b'\\' as u16)) { &B[..B.len() - 1] } else { &B[..] };
     Sorting::EqualIgnoreCase(TrimA, TrimB)
+}
+
+pub fn ArchiveRoot(Item: &Path) -> Option<PathBuf> {
+    let Chain: Vec<&Path> = Item.ancestors().collect();
+    for Prefix in Chain.into_iter().rev().skip(1) {
+        let Wide = ApiPath(Prefix);
+        let Attributes = unsafe { windows::Win32::Storage::FileSystem::GetFileAttributesW(PCWSTR(Wide.as_ptr())) };
+        if Attributes == u32::MAX {
+            return None;
+        }
+        if Attributes & AttributeDirectory == 0 {
+            return Some(Prefix.to_path_buf());
+        }
+    }
+    None
+}
+
+pub fn InArchive(Item: &Path) -> bool {
+    ArchiveRoot(Item).is_some_and(|Root| !SamePath(&Root, Item))
 }
 
 pub fn PathFromWide(Wide: &[u16]) -> PathBuf {

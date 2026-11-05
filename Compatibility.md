@@ -26,7 +26,7 @@ These paths never move. A new location requires reading from the old one.
 - Boolean values are `true`/`false`. Numbers are plain decimal. Paths are absolute Windows paths.
 - Command identifiers used in Keybindings.ini (`View.ToggleAnimations`, `App.OpenSettings`, ...) are permanent. A command that is replaced keeps its identifier as an alias that runs the replacement.
 - Theme files keep every color and size key that has ever been read. Missing keys inherit from the built-in theme.
-- Settings keys added since the first release: `ReuseWindow`, `FolderSizes`, `ShellActionsInline` (all booleans, default `true`).
+- Settings keys added since the first release: `ReuseWindow`, `FolderSizes`, `ShellActionsInline`, `AutoUpdate` (all booleans, default `true`); `SkippedVersion` (release version the user answered "Not now" for, default empty); `LastUpdateCheck` (unix seconds of the last update check, default `0`).
 - `MenuUsage.ini` section `[Usage]` maps a lower-case app action label to `count,last-used-unix-seconds`. It only ranks menu entries; deleting it resets the ranking and nothing else.
 
 ## Folder size cache
@@ -58,10 +58,19 @@ Flags are never removed and their output formats only gain lines; existing lines
 - `Drive\shell` default verb, `Drive\shell\open\command`
 - `CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command` (Win+E and the taskbar File Explorer entry)
 - `Directory\Background\shell\Flux` ("Open in Flux")
+- `CompressedFolder\shell\Open\command` default value and an empty `DelegateExecute` (zip files open in Flux)
 
 Every value that existed before is saved under `HKCU\Software\Flux\ShellBackup` before it is changed, and `--unregister-shell` restores exactly that state. Flux never writes to `HKLM`, never modifies system files, and never needs administrator rights for integration. Any new integration point must follow the same backup-and-restore rule.
 
 The running-instance handoff uses `WM_COPYDATA` with `dwData = 0x464C5558` and a UTF-16 payload (folder path, `/select,<path>`, a `::{CLSID}` location, or empty for the home folder). The payload format is append-only.
+
+While Flux is the default file manager, its window registers in the system shell window list (`IShellWindows`, class `SWC_BROWSER`) and reports the active tab's folder, so `SHOpenFolderAndSelectItems` ("Show in folder" in browsers and other apps) finds it and selects the requested items through `IShellView::SelectItem`. The registration is revoked when the window closes.
+
+## Updates
+
+- Only installed release builds check for updates; debug builds and executables under a `target` folder never do.
+- The check reads `https://api.github.com/repos/nikgeneburn/Flux/releases/latest`. A release must keep a `Flux-<version>-windows-x64.zip` asset whose top-level `Flux\` folder holds `Flux.exe` and `Modules\`; the asset's published `sha256:` digest is verified before anything is replaced.
+- Updating renames each replaced file to `<name>.old`, copies the new file in, and restores every renamed file if any step fails. Leftover `.old` files are deleted on the next start. Files the package does not contain are left untouched.
 
 ## Module ABI
 

@@ -1,3 +1,4 @@
+pub mod Browser;
 pub mod Clipboard;
 pub mod Imaging;
 pub mod Integration;
@@ -17,6 +18,7 @@ use windows::core::{PCWSTR, w};
 
 pub const TimerSmoothScroll: usize = 1;
 pub const TimerPerformance: usize = 2;
+pub const TimerUpdate: usize = 3;
 
 pub fn KeyDown(Key: u16) -> bool {
     unsafe { (GetKeyState(Key as i32) as u16 & 0x8000) != 0 }

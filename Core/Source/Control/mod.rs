@@ -18,7 +18,7 @@ use crate::Services::Workers::{CancelToken, NewIdentifier, Spawn};
 use Commands::Command;
 use Panes::{LoadState, Tab};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 impl App {
@@ -28,6 +28,13 @@ impl App {
 
     pub fn EditingAddress(&self, Pane: usize) -> bool {
         self.Focus == Focus::Address && self.ActivePane == Pane
+    }
+
+    pub fn ShellFolder(&self) -> Option<PathBuf> {
+        match &self.Tab(self.ActivePane).Location {
+            Location::Directory(Folder) => Some(Folder.clone()),
+            _ => None,
+        }
     }
 
     pub fn TabMut(&mut self, Pane: usize) -> &mut Tab {
@@ -194,9 +201,13 @@ impl App {
                 Tab.State = LoadState::Ready;
                 let Cursor = Tab.Cursor;
                 if let Location::Directory(Directory) = Tab.Location.clone() {
-                    if let Some(Watcher) = &mut self.Watcher {
-                        if !IsServerPath(&Directory) {
-                            self.Panes[Pane].Tabs[Index].Watch = Some(Watcher.Watch(Directory));
+                    let Watched = match &self.Panes[Pane].Tabs[Index].Listing.Archive {
+                        Some(Archive) => Archive.parent().map(Path::to_path_buf),
+                        None => Some(Directory),
+                    };
+                    if let (Some(Watcher), Some(Watched)) = (&mut self.Watcher, Watched) {
+                        if !IsServerPath(&Watched) {
+                            self.Panes[Pane].Tabs[Index].Watch = Some(Watcher.Watch(Watched));
                         }
                     }
                 }
@@ -260,7 +271,14 @@ impl App {
                 if self.Panes[Pane].Tabs[Index].Watch != Some(Batch.Watch) {
                     continue;
                 }
-                if Batch.Overflow || Batch.Records.len() > 512 {
+                let ArchiveTouched = self.Panes[Pane].Tabs[Index].Listing.Archive.as_ref().map(|Archive| {
+                    let Name: Vec<u16> = Archive.file_name().map(|Name| Name.encode_wide().collect()).unwrap_or_default();
+                    Batch.Overflow || Batch.Records.iter().any(|Record| crate::FileSystem::Sorting::EqualIgnoreCase(&Record.Name, &Name))
+                });
+                if ArchiveTouched == Some(false) {
+                    continue;
+                }
+                if ArchiveTouched == Some(true) || Batch.Overflow || Batch.Records.len() > 512 {
                     self.Panes[Pane].Tabs[Index].Watch = None;
                     let Focused = {
                         let Tab = &self.Panes[Pane].Tabs[Index];
@@ -409,6 +427,8 @@ impl App {
             Some(Item.clone())
         } else if Tab.Listing.Extension(Index).iter().map(|&Unit| Sorting::Fold(Unit)).eq("lnk".encode_utf16()) {
             Platform::Shell::ShortcutTarget(&Item).filter(|Resolved| Enumerate::Stat(Resolved).is_some_and(|Data| Data.Attributes & crate::FileSystem::AttributeDirectory != 0))
+        } else if Platform::Shell::IsArchive(&Item) {
+            Some(Item.clone())
         } else {
             None
         };
@@ -438,13 +458,55 @@ impl App {
 
     pub fn OpenExternal(&mut self, Text: &str) {
         let Pane = self.ActivePane;
-        let (Target, Select) = Platform::Integration::ResolveTarget(Text).unwrap_or_else(|| (self.HomeLocation(), None));
-        if Select.is_some() || self.Tab(Pane).Location != Target {
-            self.OpenTab(Pane, Target);
+        self.ShellFresh = true;
+        let Resolved = if Text.trim().is_empty() { Some((self.HomeLocation(), None)) } else { Platform::Integration::ResolveTarget(Text) };
+        let Some((Target, Select)) = Resolved else {
+            if let Err(Message) = Platform::Shell::OpenInExplorerRaw(Text) {
+                self.Fail("File Explorer could not be opened", &Message);
+            }
+            return;
+        };
+        let Same = |Left: &Location| match (Left, &Target) {
+            (Location::Directory(Left), Location::Directory(Right)) => crate::FileSystem::SamePath(Left, Right),
+            (Left, Right) => Left == Right,
+        };
+        let Shown = |App: &App, Candidate: usize| App.Panes[Candidate].Tabs.iter().position(|Tab| Same(&Tab.Location)).map(|Index| (Candidate, Index));
+        let Panes: Vec<usize> = if self.Settings.DualPane { vec![Pane, 1 - Pane] } else { vec![0] };
+        let (Owner, Index) = match Panes.into_iter().find_map(|Candidate| Shown(self, Candidate)) {
+            Some((Owner, Index)) => {
+                self.ActivateTab(Owner, Index);
+                (Owner, Index)
+            }
+            None => {
+                self.OpenTab(Pane, Target);
+                (Pane, self.Panes[Pane].Active)
+            }
+        };
+        let Some(Name) = Select.as_ref().and_then(|Item| Item.file_name()).map(|Name| Name.encode_wide().collect::<Vec<u16>>()) else { return };
+        let Tab = &mut self.Panes[Owner].Tabs[Index];
+        if Tab.State == LoadState::Ready && Tab.FocusName(&Name, false) {
+            if let Some(Cursor) = Tab.Cursor {
+                self.RevealIndex(Owner, Cursor);
+            }
+            self.RefreshInspector();
+        } else {
+            Tab.PendingFocus = Some(Name);
         }
-        if let Some(Name) = Select.as_ref().and_then(|Item| Item.file_name()) {
-            self.TabMut(Pane).PendingFocus = Some(Name.encode_wide().collect());
+    }
+
+    pub fn RevealItem(&mut self, Item: &Path, Keep: bool) {
+        let Pane = self.ActivePane;
+        let Name: Vec<u16> = Item.file_name().map(|Name| Name.encode_wide().collect()).unwrap_or_default();
+        let Tab = self.Tab(Pane);
+        let Shown = Tab.State == LoadState::Ready && Item.parent().zip(Tab.Location.DirectoryPath()).is_some_and(|(Parent, Folder)| crate::FileSystem::SamePath(Parent, Folder));
+        if Keep && Shown && self.TabMut(Pane).FocusName(&Name, true) {
+            if let Some(Cursor) = self.Tab(Pane).Cursor {
+                self.RevealIndex(Pane, Cursor);
+            }
+            self.RefreshInspector();
+            return;
         }
+        self.OpenExternal(&format!("/select,{}", Item.display()));
     }
 
     pub fn CloseTab(&mut self, Pane: usize, Index: usize) {
@@ -471,6 +533,7 @@ impl App {
         if Active > Index || Active >= self.Panes[Pane].Tabs.len() {
             self.Panes[Pane].Active = Active.saturating_sub(1);
         }
+        self.EnsureLoaded(Pane);
         self.CancelRename();
         self.RequestFreeSpace(Pane);
         self.RefreshInspector();
@@ -486,6 +549,7 @@ impl App {
             if self.Focus == Focus::Address {
                 self.Focus = Focus::List;
             }
+            self.EnsureLoaded(Pane);
             self.RequestFreeSpace(Pane);
             self.WatchFolderSizes(Pane);
             self.RefreshInspector();
@@ -524,7 +588,16 @@ impl App {
         self.Panes[Target].Tabs.push(Item);
         self.Panes[Target].Active = self.Panes[Target].Tabs.len() - 1;
         self.ActivePane = Target;
+        self.EnsureLoaded(From);
+        self.EnsureLoaded(Target);
         self.Invalidate();
+    }
+
+    fn EnsureLoaded(&mut self, Pane: usize) {
+        let Index = self.Panes[Pane].Active;
+        if self.Panes[Pane].Tabs.get(Index).is_some_and(|Tab| Tab.Token == 0) {
+            self.LoadTab(Pane, Index);
+        }
     }
 
     pub fn RevealIndex(&mut self, Pane: usize, Index: u32) {

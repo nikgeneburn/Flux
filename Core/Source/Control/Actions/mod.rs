@@ -214,10 +214,18 @@ impl App {
         self.Overlay = None;
         self.Focus = Focus::List;
         self.NextCollision();
+        self.ShowPendingUpdate();
         self.Invalidate();
     }
 
     pub fn StartOperation(&mut self, Value: Request, Reason: Purpose) {
+        if let Request::CopyInto { Sources, Destination } | Request::MoveInto { Sources, Destination } = &Value {
+            if self.ArchiveDestination(Destination) {
+                let Moving = matches!(Value, Request::MoveInto { .. });
+                self.Deferred.push(crate::Application::Deferred::DropShell { Sources: Sources.clone(), Destination: Destination.clone(), Moving });
+                return;
+            }
+        }
         let Identifier = NewIdentifier();
         let Sink = self.Sink.clone();
         let Notify = Arc::new(move |Update: Notification| Sink.Send(crate::Application::Event::Operation(Update)));
@@ -269,8 +277,13 @@ impl App {
                         }
                     }
                 }
+                let ArchiveWork = !matches!(&Summary.Request, Request::CreateFolder(Item) | Request::CreateFile(Item) if !crate::FileSystem::InArchive(Item));
+                if ArchiveWork {
+                    let Created = Summary.Created.first().cloned();
+                    self.ReloadArchives(Created);
+                }
                 if let Request::CreateFolder(Item) | Request::CreateFile(Item) = &Summary.Request {
-                    if !Summary.Created.is_empty() {
+                    if !Summary.Created.is_empty() && !crate::FileSystem::InArchive(Item) {
                         self.FocusCreated(Item.clone());
                     }
                 }
@@ -297,6 +310,34 @@ impl App {
             }
         }
         self.Invalidate();
+    }
+
+    pub fn ReloadArchives(&mut self, Focus: Option<PathBuf>) {
+        for Pane in 0..self.Panes.len() {
+            for Index in 0..self.Panes[Pane].Tabs.len() {
+                let Tab = &mut self.Panes[Pane].Tabs[Index];
+                if Tab.Listing.Archive.is_none() {
+                    continue;
+                }
+                let Wanted = Focus.as_ref().filter(|Item| Item.parent().is_some_and(|Parent| Tab.Location.DirectoryPath().is_some_and(|Shown| crate::FileSystem::SamePath(Parent, Shown))));
+                Tab.PendingFocus = match Wanted {
+                    Some(Item) => Item.file_name().map(|Name| std::os::windows::ffi::OsStrExt::encode_wide(Name).collect()),
+                    None => Tab.Cursor.map(|Cursor| Tab.Listing.Name(Cursor).to_vec()),
+                };
+                let Scroll = Tab.Scroll;
+                self.LoadTab(Pane, Index);
+                self.Panes[Pane].Tabs[Index].Scroll = Scroll;
+            }
+        }
+    }
+
+    fn ArchiveDestination(&self, Destination: &Path) -> bool {
+        self.Panes.iter().flat_map(|Pane| Pane.Tabs.iter()).any(|Tab| {
+            Tab.Listing.Archive.is_some()
+                && Tab.Location.DirectoryPath().is_some_and(|Shown| {
+                    crate::FileSystem::SamePath(Shown, Destination) || Destination.parent().is_some_and(|Parent| crate::FileSystem::SamePath(Parent, Shown))
+                })
+        })
     }
 
     fn FocusCreated(&mut self, Item: PathBuf) {
@@ -391,6 +432,7 @@ impl App {
                 }
             }
             PromptPurpose::Information => {}
+            PromptPurpose::Update(Item) => self.AnswerUpdate(Item, Button, Toggle),
         }
         self.CloseOverlay();
     }
@@ -426,7 +468,11 @@ impl App {
 
     pub fn PasteInto(&mut self, Directory: &Path) {
         let Some((Items, Cut)) = Clipboard::GetFiles(self.Window) else {
-            self.Inform("The clipboard does not contain files");
+            if !Clipboard::HasShellData() {
+                self.Inform("The clipboard does not contain files");
+                return;
+            }
+            self.Deferred.push(Deferred::PasteShell(Directory.to_path_buf()));
             return;
         };
         if Cut {

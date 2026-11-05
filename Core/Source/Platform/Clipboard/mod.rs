@@ -84,12 +84,76 @@ pub fn SetFiles(Window: HWND, Items: &[PathBuf], Cut: bool) -> bool {
     if Items.is_empty() {
         return false;
     }
+    let Effect: u32 = if Cut { EffectMove } else { EffectCopy | EffectLink };
+    if Items.iter().any(|Item| crate::FileSystem::InArchive(Item)) {
+        return SetShellItems(Items, Effect);
+    }
     let Some(_Session) = ClipboardSession::Open(Window) else { return false };
     unsafe {
         let _ = EmptyClipboard();
     }
-    let Effect: u32 = if Cut { EffectMove } else { EffectCopy | EffectLink };
     Place(CF_HDROP.0 as u32, &DropFilesBytes(Items)) && Place(DropEffectFormat(), &Effect.to_le_bytes())
+}
+
+fn SetShellItems(Items: &[PathBuf], Effect: u32) -> bool {
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+    let Some((Object, _Pidls)) = crate::Platform::Shell::DataObject(Items) else { return false };
+    if let Some(Memory) = GlobalFromBytes(&Effect.to_le_bytes()) {
+        let Format = FORMATETC { cfFormat: DropEffectFormat() as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+        let Medium = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: Memory }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
+        if unsafe { Object.SetData(&Format, &Medium, true) }.is_err() {
+            let _ = unsafe { GlobalFree(Some(Memory)) };
+        }
+    }
+    unsafe { windows::Win32::System::Ole::OleSetClipboard(&Object) }.is_ok()
+}
+
+fn ShellDataFormat() -> u32 {
+    unsafe { RegisterClipboardFormatW(w!("Shell IDList Array")) }
+}
+
+pub fn PasteShell(Window: HWND, Destination: &std::path::Path) -> Result<(), String> {
+    let Object = unsafe { windows::Win32::System::Ole::OleGetClipboard() }.map_err(|Error| Error.message())?;
+    let Preferred = PreferredEffect().unwrap_or(EffectCopy);
+    DropObject(Window, &Object, Destination, if Preferred & EffectMove != 0 { EffectMove } else { EffectCopy })
+}
+
+pub fn DropFiles(Window: HWND, Sources: &[PathBuf], Destination: &std::path::Path, Moving: bool) -> Result<(), String> {
+    let (Object, _Pidls) = crate::Platform::Shell::DataObject(Sources).ok_or("The items could not be read")?;
+    DropObject(Window, &Object, Destination, if Moving { EffectMove } else { EffectCopy })
+}
+
+fn DropObject(Window: HWND, Object: &windows::Win32::System::Com::IDataObject, Destination: &std::path::Path, Allowed: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::POINTL;
+    use windows::Win32::System::Ole::DROPEFFECT;
+    use windows::Win32::System::SystemServices::MK_LBUTTON;
+    let Target = DragDrop::FolderDropTarget(Window, Destination).ok_or("The destination does not accept items")?;
+    let Point = POINTL::default();
+    let mut Effect = DROPEFFECT(Allowed);
+    unsafe { Target.DragEnter(Object, MK_LBUTTON, Point, &mut Effect) }.map_err(|Error| Error.message())?;
+    if Effect.0 == 0 {
+        let _ = unsafe { Target.DragLeave() };
+        return Err("The destination does not accept these items".to_string());
+    }
+    Effect = DROPEFFECT(Allowed);
+    unsafe { Target.Drop(Object, MK_LBUTTON, Point, &mut Effect) }.map_err(|Error| Error.message())
+}
+
+fn PreferredEffect() -> Option<u32> {
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+    let Object = unsafe { windows::Win32::System::Ole::OleGetClipboard() }.ok()?;
+    let Format = FORMATETC { cfFormat: DropEffectFormat() as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+    let mut Medium = unsafe { Object.GetData(&Format) }.ok()?;
+    let Memory = unsafe { Medium.u.hGlobal };
+    let Pointer = unsafe { GlobalLock(Memory) } as *const u32;
+    let Value = if Pointer.is_null() { None } else { Some(unsafe { Pointer.read_unaligned() }) };
+    unsafe {
+        if !Pointer.is_null() {
+            let _ = GlobalUnlock(Memory);
+        }
+        windows::Win32::System::Ole::ReleaseStgMedium(&mut Medium);
+    }
+    Value
 }
 
 pub fn FilesFromDrop(Drop: HDROP) -> Vec<PathBuf> {
@@ -107,7 +171,11 @@ pub fn FilesFromDrop(Drop: HDROP) -> Vec<PathBuf> {
 }
 
 pub fn HasFiles() -> bool {
-    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok()
+    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok() || HasShellData()
+}
+
+pub fn HasShellData() -> bool {
+    unsafe { IsClipboardFormatAvailable(ShellDataFormat()) }.is_ok()
 }
 
 pub fn GetFiles(Window: HWND) -> Option<(Vec<PathBuf>, bool)> {

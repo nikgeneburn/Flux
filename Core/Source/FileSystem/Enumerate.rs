@@ -4,7 +4,10 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, PROPERTYKEY};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+use windows::Win32::System::SystemServices::{SFGAO_FOLDER, SFGAO_STREAM};
+use windows::Win32::UI::Shell::{BHID_EnumItems, IEnumShellItems, IShellItem, IShellItem2, SHCreateItemFromParsingName, SIGDN_PARENTRELATIVEPARSING};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
@@ -14,7 +17,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
 use windows::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE};
-use windows::core::{Owned, PCWSTR};
+use windows::core::{GUID, Interface, Owned, PCWSTR};
 
 pub const BufferSize: usize = 64 * 1024;
 
@@ -172,7 +175,7 @@ pub fn LoadDirectory(
     let mut Reported = 0usize;
     let mut NextReport = Duration::from_millis(60);
     let mut Cancelled = false;
-    ForEach(Directory, &mut Buffer, &mut |Raw| {
+    let Loaded = ForEach(Directory, &mut Buffer, &mut |Raw| {
         Data.Push(&[], Raw);
         if Data.Entries.len() & 1023 == 0 {
             if Cancel.IsCancelled() {
@@ -187,8 +190,17 @@ pub fn LoadDirectory(
             }
         }
         true
-    })?;
-    if Cancelled {
+    });
+    if let Err(Code) = Loaded {
+        let Some(Root) = super::ArchiveRoot(Directory) else { return Err(Code) };
+        Data = Listing::New(Some(Directory.to_path_buf()));
+        Data.Archive = Some(Root);
+        ForEachShell(Directory, &mut |Raw| {
+            Data.Push(&[], Raw);
+            !Cancel.IsCancelled()
+        })?;
+    }
+    if Cancelled || Cancel.IsCancelled() {
         return Err(1223);
     }
     Data.Text.shrink_to_fit();
@@ -308,4 +320,49 @@ pub fn DirectorySize(Directory: &Path, Cancel: &CancelToken, Progress: &mut dyn 
         }
     }
     Some((Bytes, Files, Folders))
+}
+
+struct Apartment(bool);
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+const PropertySize: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xb725f130_47ef_101a_a5f1_02608c9eebac), pid: 12 };
+const PropertyModified: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xb725f130_47ef_101a_a5f1_02608c9eebac), pid: 14 };
+
+fn ShellName(Item: &IShellItem) -> Option<Vec<u16>> {
+    let Text = unsafe { Item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING) }.ok()?;
+    let Name = unsafe { Text.as_wide() }.to_vec();
+    unsafe { CoTaskMemFree(Some(Text.0 as *const _)) };
+    Some(Name)
+}
+
+pub fn ForEachShell(Directory: &Path, Visit: &mut dyn FnMut(&RawEntry) -> bool) -> Result<(), u32> {
+    let _Apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok());
+    let Wide = super::ShellPath(Directory);
+    let Folder: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(Wide.as_ptr()), None) }.map_err(|Error| Win32Code(&Error))?;
+    let Items: IEnumShellItems = unsafe { Folder.BindToHandler(None, &BHID_EnumItems) }.map_err(|Error| Win32Code(&Error))?;
+    loop {
+        let mut Batch: [Option<IShellItem>; 1] = [None];
+        let mut Fetched = 0u32;
+        if unsafe { Items.Next(&mut Batch, Some(&mut Fetched)) }.is_err() || Fetched == 0 {
+            return Ok(());
+        }
+        let Some(Child) = Batch[0].take() else { return Ok(()) };
+        let Some(Name) = ShellName(&Child) else { continue };
+        let Flags = unsafe { Child.GetAttributes(SFGAO_FOLDER | SFGAO_STREAM) }.unwrap_or_default();
+        let IsFolder = Flags.0 & SFGAO_FOLDER.0 != 0 && Flags.0 & SFGAO_STREAM.0 == 0;
+        let Details = Child.cast::<IShellItem2>().ok();
+        let Size = if IsFolder { 0 } else { Details.as_ref().and_then(|Item| unsafe { Item.GetUInt64(&PropertySize) }.ok()).unwrap_or(0) };
+        let Modified = Details.as_ref().and_then(|Item| unsafe { Item.GetFileTime(&PropertyModified) }.ok()).map(FileTimeValue).unwrap_or(0);
+        let Raw = RawEntry { Name: &Name, Attributes: if IsFolder { AttributeDirectory } else { 0x80 }, Size, Modified, Created: Modified };
+        if !Visit(&Raw) {
+            return Ok(());
+        }
+    }
 }

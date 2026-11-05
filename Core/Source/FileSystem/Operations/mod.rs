@@ -531,6 +531,10 @@ struct Engine {
 
 impl Engine {
     fn Run(&mut self, Work: &Request, Owner: isize) {
+        if Recycle::Touches(Work) {
+            Recycle::Archive(self, Work, Owner);
+            return;
+        }
         match Work {
             Request::CopyInto { Sources, Destination } => self.Transfer(PairsInto(Sources, Destination), false),
             Request::MoveInto { Sources, Destination } => self.Transfer(PairsInto(Sources, Destination), true),

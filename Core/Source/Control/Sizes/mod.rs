@@ -41,7 +41,7 @@ impl App {
         let Tab = self.Tab(Pane);
         let Shown = Pane == 0 || self.Settings.DualPane;
         let Folders: Vec<PathBuf> = match &Tab.Location {
-            Location::Directory(Directory) if Shown && !Directory.as_os_str().encode_wide().take(2).eq([b'\\' as u16, b'\\' as u16]) => (0..Tab.Listing.Len() as u32)
+            Location::Directory(Directory) if Shown && Tab.Listing.Archive.is_none() && !Directory.as_os_str().encode_wide().take(2).eq([b'\\' as u16, b'\\' as u16]) => (0..Tab.Listing.Len() as u32)
                 .filter(|&Index| Tab.Listing.Entries[Index as usize].Flags & FlagRemoved == 0 && Tab.Listing.IsDirectory(Index))
                 .map(|Index| Tab.Listing.FullPath(Index))
                 .collect(),
